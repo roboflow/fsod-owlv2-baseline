@@ -1,0 +1,5 @@
+roboflow
+tqdm
+inference
+supervision
+numpy<2
