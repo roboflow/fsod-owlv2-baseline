@@ -1,5 +1,5 @@
 roboflow
 tqdm
-inference
+inference @ git+https://github.com/roboflow/inference.git@72cad23a0adc3401cf7deaa5b20b75dd4af5c9d8
 supervision
 numpy<2
