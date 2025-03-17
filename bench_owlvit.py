@@ -1,4 +1,5 @@
 import roboflow
+import torch
 from roboflow.core.project import Project
 from tqdm import tqdm
 from typing import List
@@ -11,18 +12,27 @@ import supervision as sv
 import json
 from copy import deepcopy
 from PIL import Image
+from transformers import Owlv2ForObjectDetection, Owlv2Processor
+from transformers import pipeline
 
 api_key = ""
-if not api_key:
-    raise ValueError("API key not found")
-
 rf = roboflow.Roboflow(api_key=api_key)
 data_dir = os.path.join("scratch", "owlvit_data")
 save_dir = os.path.join("scratch", "owlvit_results")
 os.makedirs(save_dir, exist_ok=True)
 
-workspace = rf.workspace("rf-100-vl-fsod")
-assert len(workspace.project_list) == 100
+import supervision as sv
+import json
+from pathlib import Path
+import numpy as np
+
+API_KEY_OLD = ""
+rf_old = roboflow.Roboflow(api_key=API_KEY_OLD)
+workspace = rf_old.workspace("roboflow100vl-fsod")
+# full_api_key = "jyOhx1yGm4JczykPv075"
+fsod_api_key = "cUalZjFpte9g6QpLKlTJ"
+rf_fosd = roboflow.Roboflow(api_key=fsod_api_key)
+workspace = rf_fosd.workspace("rf-100-vl-fsod")
 
 # Create a class to handle COCO format export
 class COCOExporter:
@@ -147,11 +157,46 @@ def benchmark_owlvit():
     for project in tqdm(projects, desc="Benchmarking projects"):
         stats = benchmark_project(project)
         all_stats[project] = stats
-        with open(os.path.join(save_dir, "owlvit_stats.json"), "w") as f:
+        with open(os.path.join(save_dir, "owlvit_stats_zshot.json"), "w") as f:
             json.dump(all_stats, f)
 
     return all_stats
 
+def do_prediction(model, image_name, train_dataset, classes, class_map, text=False):
+    owl_vit_request = construct_prompt(image_name, train_dataset, classes, text=text)
+    response = model.infer_from_request(owl_vit_request)
+    for pred in response.predictions:
+        pred.class_id = class_map[pred.class_name]
+    detections  = sv.Detections.from_inference(response)
+    return detections
+
+def do_prediction_label(model, processor, image_name, classes, class_map):
+    image = Image.open(image_name).convert("RGB")
+    text_queries = classes
+    xyxy = []
+    confidence = []
+    class_id = []
+    inputs = processor(images=image, text=[text_queries], return_tensors="pt")
+    target_sizes = torch.tensor([image.size[::-1]])
+    with torch.no_grad():
+        outputs = model(**inputs)
+    predictions = processor.post_process_object_detection(outputs, target_sizes=target_sizes, threshold=0.1)[0]
+    for score, label, box in zip(predictions["scores"], predictions["labels"], predictions["boxes"]):
+        xyxy.append(
+            np.array([box[0], box[1], box[2], box[3]])
+        )
+        confidence.append(score)
+        class_id.append(label)
+    
+    if not xyxy:
+        return sv.Detections.empty()
+
+    detections = sv.Detections(
+        xyxy=np.array(xyxy),
+        confidence=np.array(confidence),
+        class_id=np.array(class_id),
+    )
+    return detections
 
 def benchmark_project(project):
     model = OwlV2()
@@ -170,14 +215,10 @@ def benchmark_project(project):
     gt_detections = []
     for image_name, _, annotations in tqdm(test_dataset, desc=f"Processing {project}"):
         gt_detections.append(annotations)
-        owl_vit_request = construct_prompt(image_name, train_dataset, classes)
-        response = model.infer_from_request(owl_vit_request)
-        for pred in response.predictions:
-            pred.class_id = class_map[pred.class_name]
-        detections  = sv.Detections.from_inference(response)
+        detections = do_prediction(model, image_name, train_dataset, classes, class_map, text=True)
         all_detections.append(detections)
     
-    save_detections_as_coco(test_dataset.images, all_detections, classes, f"preds_{project}.json")
+    save_detections_as_coco(test_dataset.images, all_detections, classes, f"preds_{project}_zshot.json")
     
     map = sv.MeanAveragePrecision.from_detections(all_detections, gt_detections)
     map50 = float(map.map50)
@@ -187,44 +228,56 @@ def benchmark_project(project):
     
 
 
-def construct_prompt(test_image, dataset, classes):
+def construct_prompt(test_image, dataset, classes, text=False):
     training_data = []
-    for image_name, _, annotations in dataset:
-        boxes = []
-        for xyxy, _, _, class_id, _, _ in annotations:
-            image_obj = {
-                "type": "file",
-                "value": image_name,
-            }
-            x, y, w, h = (xyxy[0] + xyxy[2])//2, (xyxy[1] + xyxy[3])//2, xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]
-            x, y, w, h = int(x), int(y), int(w), int(h)
-            boxes.append({
-                "x": x,
-                "y": y,
-                "w": w,
-                "h": h,
-                "cls": classes[int(class_id.item())],
-                "negative": False,
+    if not text:
+        for image_name, _, annotations in dataset:
+            boxes = []
+            for xyxy, _, _, class_id, _, _ in annotations:
+                image_obj = {
+                    "type": "file",
+                    "value": image_name,
+                }
+                x, y, w, h = (xyxy[0] + xyxy[2])//2, (xyxy[1] + xyxy[3])//2, xyxy[2] - xyxy[0], xyxy[3] - xyxy[1]
+                x, y, w, h = int(x), int(y), int(w), int(h)
+                boxes.append({
+                    "x": x,
+                    "y": y,
+                    "w": w,
+                    "h": h,
+                    "cls": classes[int(class_id.item())],
+                    "negative": False,
+                })
+            training_data.append({
+                "image": image_obj,
+                "boxes": boxes,
             })
-        training_data.append({
-            "image": image_obj,
-            "boxes": boxes,
-        })
 
-    test_image = {
-        "type": "file",
-        "value": test_image,
-    }
-    request = OwlV2InferenceRequest(
-        image=test_image,
-        training_data=training_data,
-        visualize_predictions=False,
-        confidence=0.1,
-    )
+        test_image = {
+            "type": "file",
+            "value": test_image,
+        }
+        request = OwlV2InferenceRequest(
+            image=test_image,
+            training_data=training_data,
+            visualize_predictions=False,
+            confidence=0.1,
+        )
+    else:
+        test_image = {
+            "type": "file",
+            "value": test_image,
+        }
+        request = OwlV2InferenceRequest(
+            image=test_image,
+            training_data=classes,
+            visualize_predictions=False,
+            confidence=0.1,
+        )
     return request
 
 def report_stats():
-    with open("scratch/owlvit_results/owlvit_stats.json", "r") as f:
+    with open("scratch/owlvit_results/owlvit_stats_zshot.json", "r") as f:
         stats = json.load(f)
     
     print("Project, MAP50, MAP50_95")
@@ -232,7 +285,7 @@ def report_stats():
         print(f"{project}, {stat['map50']}, {stat['map50_95']}")
     
     print("Average MAP50, MAP50_95")
-    print(f"{np.mean([stat['map50'] for stat in stats.values()]):.2f}, {np.mean([stat['map50_95'] for stat in stats.values()]):.2f}")
+    print(f"{np.mean([stat['map50'] for stat in stats.values()]):.5f}, {np.mean([stat['map50_95'] for stat in stats.values()]):.5f}")
     with open("scratch/name_to_label.json", "r") as f:
         name_to_label = json.load(f)
     
@@ -242,13 +295,17 @@ def report_stats():
     from collections import defaultdict
     cats = defaultdict(list)
     cats_map50 = defaultdict(list)
+    new_name_to_label = {}
     for name_to_label_key, stat_key in zip(name_to_label_keys, stats_keys):
         cats[name_to_label[name_to_label_key]].append(stats[stat_key]['map50_95'])
         cats_map50[name_to_label[name_to_label_key]].append(stats[stat_key]['map50'])
+        new_name_to_label[stat_key] = name_to_label[name_to_label_key]
     
     for cat, stats in cats.items():
-        print(f"{cat} map50_95: {np.mean(stats):.2f}")
-        print(f"{cat} map50: {np.mean(cats_map50[cat]):.2f}")
+        print(f"{cat} map50_95: {np.mean(stats):.4f}")
+        print(f"{cat} map50: {np.mean(cats_map50[cat]):.4f}")
 
 if __name__ == "__main__":
-    pass
+    # download_projects()
+    benchmark_owlvit()
+    # report_stats()``
